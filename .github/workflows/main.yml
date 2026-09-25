@@ -3,7 +3,7 @@ name: Automated Shorts Generator Pipeline
 on:
   schedule:
     - cron: '0 15 * * *'
-  workflow_dispatch: # Allows you to click "Run Workflow" manually from GitHub UI
+  workflow_dispatch: # Allows manual trigger button in the UI
 
 jobs:
   build-and-generate:
@@ -13,7 +13,6 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-     Stein: Set up Python 3.10
     - name: Set up Python 3.10
       uses: actions/setup-python@v5
       with:
@@ -37,10 +36,9 @@ jobs:
       run: |
         python main.py
 
-    # 📥 EXTRACTION STEP: Saves the file to GitHub before the server vanishes
     - name: Upload Final Video Artifact
       uses: actions/upload-artifact@v4
       with:
         name: MrBeast-Style-Short-Video
         path: assets/final/final_short.mp4
-        retention-days: 5 # Saves space; keeps the download link active for 5 days
+        retention-days: 5
