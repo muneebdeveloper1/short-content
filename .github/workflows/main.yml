@@ -1,4 +1,3 @@
-```yaml
 name: AudioVerse Video Generator
 
 on:
@@ -146,4 +145,3 @@ jobs:
             assets/final/video_metadata.json
           if-no-files-found: warn
           retention-days: 5
-```
