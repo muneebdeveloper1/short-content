@@ -1,212 +1,184 @@
 import os
 import random
+import re
 import ffmpeg
+
 
 class Composer:
     def __init__(self):
         self.temp_dir = os.path.join(os.getcwd(), "assets", "temp")
         self.final_dir = os.path.join(os.getcwd(), "assets", "final")
         self.avatar_path = os.path.join(os.getcwd(), "assets", "avatar", "avatars.mp4")
-        
         os.makedirs(self.temp_dir, exist_ok=True)
         os.makedirs(self.final_dir, exist_ok=True)
-        self.transitions = ['fade', 'diagbr', 'diagtl']
+        self.transitions = ["fade", "wipeleft", "wiperight", "smoothleft"]
+        self.width, self.height, self.fps = 1920, 1080, 30
+        self.visual_change_seconds = 4.5
+        self.transition_seconds = 0.25
 
     def get_duration(self, filepath):
         try:
-            probe = ffmpeg.probe(filepath)
-            return float(probe['format']['duration'])
-        except:
+            return float(ffmpeg.probe(filepath)["format"]["duration"])
+        except Exception:
             return 0.0
 
+    def _fit_landscape(self, stream):
+        return (stream.filter("scale", self.width, self.height, force_original_aspect_ratio="increase")
+                     .filter("crop", self.width, self.height)
+                     .filter("setsar", "1")
+                     .filter("fps", fps=self.fps, round="up"))
+
     def process_scene(self, scene, video_pair, is_avatar=False):
-        """
-        Combines Audio with Visuals.
-        - If Avatar: Loop single video + CROP LOGO.
-        - If Stock: Split duration 50/50 between Video A and Video B.
-        """
-        scene_id = scene['id']
-        audio_path = scene['audio_path']
-        total_duration = scene['duration']
+        scene_id = scene["id"]
+        audio_path = scene.get("audio_path")
+        total_duration = float(scene.get("duration", 0) or 0)
+        if not audio_path or total_duration <= 0:
+            print(f"Scene {scene_id} has no valid narration; skipping.")
+            return None
         output_path = os.path.join(self.temp_dir, f"scene_{scene_id}.mp4")
-
         try:
-            input_audio = ffmpeg.input(audio_path)
-
             if is_avatar:
-                # --- AVATAR MODE (Single Loop + CROP) ---
-                print(f"   ⚙️ Processing Scene {scene_id}: 🤖 Avatar Mode (Cropped)")
-                
-                video_stream = (
-                    ffmpeg.input(video_pair[0], stream_loop=-1)
-                    .trim(duration=total_duration + 0.5)
-                    .setpts('PTS-STARTPTS')
-                    
-                    # ---------------------------------------------------------
-                    # ✂️ LOGO REMOVAL CROP
-                    # ---------------------------------------------------------
-                    # Current setting: Removes 150px from BOTTOM.
-                    .filter('crop', 'iw', 'ih-150', 0, 0) 
-                    
-                    # ---------------------------------------------------------
-                    # 📏 RESIZE & CENTER
-                    # ---------------------------------------------------------
-                    .filter('scale', 1080, 1920, force_original_aspect_ratio='increase')
-                    .filter('crop', 1080, 1920)
-                    .filter('fps', fps=30, round='up')
-                )
+                source = ffmpeg.input(video_pair[0], stream_loop=-1).video
+                video_stream = self._fit_landscape(source.filter("trim", duration=total_duration).setpts("PTS-STARTPTS"))
+                video_stream = video_stream.filter("trim", duration=total_duration).setpts("PTS-STARTPTS")
             else:
-                # --- DUAL VIDEO MODE (50/50 Split) ---
-                print(f"   ⚙️ Processing Scene {scene_id}: 🎞️ A/B Split Mode")
                 path_a, path_b = video_pair
-                
-                duration_a = total_duration / 2
-                duration_b = (total_duration / 2) + 0.5 
-
-                stream_a = (
-                    ffmpeg.input(path_a, stream_loop=-1)
-                    .trim(duration=duration_a)
-                    .setpts('PTS-STARTPTS')
-                    .filter('scale', 1080, 1920).filter('crop', 1080, 1920)
-                    .filter('fps', fps=30, round='up')
-                )
-
-                stream_b = (
-                    ffmpeg.input(path_b, stream_loop=-1)
-                    .trim(duration=duration_b)
-                    .setpts('PTS-STARTPTS')
-                    .filter('scale', 1080, 1920).filter('crop', 1080, 1920)
-                    .filter('fps', fps=30, round='up')
-                )
-
-                video_stream = ffmpeg.concat(stream_a, stream_b, v=1, a=0)
-
-            # Combine Video + Audio
-            runner = ffmpeg.output(
-                video_stream, 
-                input_audio, 
-                output_path, 
-                vcodec='libx264', 
-                acodec='aac', 
-                pix_fmt='yuv420p',
-                shortest=None
-            )
-            
-            runner.run(overwrite_output=True, quiet=True)
+                remaining, index, pieces = total_duration, 0, []
+                while remaining > 0.02:
+                    segment_duration = min(self.visual_change_seconds, remaining)
+                    source_path = path_a if index % 2 == 0 else path_b
+                    source = ffmpeg.input(source_path, stream_loop=-1).video
+                    segment = source.filter("trim", duration=segment_duration).setpts("PTS-STARTPTS")
+                    segment = self._fit_landscape(segment).filter("trim", duration=segment_duration).setpts("PTS-STARTPTS")
+                    pieces.append(segment)
+                    remaining -= segment_duration
+                    index += 1
+                video_stream = pieces[0] if len(pieces) == 1 else ffmpeg.concat(*pieces, v=1, a=0)
+            audio_stream = ffmpeg.input(audio_path).audio
+            (ffmpeg.output(video_stream, audio_stream, output_path, vcodec="libx264", acodec="aac",
+                           pix_fmt="yuv420p", r=self.fps, movflags="faststart",
+                           preset=os.getenv("FFMPEG_PRESET", "veryfast"))
+             .run(overwrite_output=True, quiet=True))
             return output_path
-
-        except ffmpeg.Error as e:
-            print(f"❌ Render Fail Scene {scene_id}: {e.stderr.decode('utf8') if e.stderr else str(e)}")
+        except ffmpeg.Error as exc:
+            stderr = (exc.stderr or b"").decode("utf8", errors="replace")
+            print(f"Render failed for scene {scene_id}: {stderr[-2500:]}")
+            return None
+        except Exception as exc:
+            print(f"Render failed for scene {scene_id}: {exc}")
             return None
 
     def render_all_scenes(self, script_data, video_pairs):
-        """
-        Iterates script, handles Avatar injection logic (TWICE), and renders individual scenes.
-        """
-        rendered_paths = []
-        
-        # 1. Randomly pick TWO distinct middle scenes for the Avatar
-        # We pick from range [1, len-2] to avoid the Hook (0) and Outro (last)
+        rendered = []
+        self.rendered_scenes = []
         avatar_indices = []
-        
-        # Only inject if we have enough scenes (need at least 4 scenes to safely pick 2 middle ones)
-        if len(script_data) >= 4 and os.path.exists(self.avatar_path):
-            valid_range = list(range(1, len(script_data) - 1)) # All valid middle indices
-            
-            # Pick 2 unique indices if possible, otherwise just 1
-            count_to_pick = 2 if len(valid_range) >= 2 else 1
-            avatar_indices = random.sample(valid_range, count_to_pick)
-            
-            # Sort them just for cleaner logging
-            avatar_indices.sort()
-            human_readable_indices = [i + 1 for i in avatar_indices]
-            print(f"🎲 Avatar set for Scenes: {human_readable_indices}")
-
-        # 2. Render Loop
+        if len(script_data) >= 4 and os.path.exists(self.avatar_path) and os.getenv("USE_AVATAR", "false").lower() == "true":
+            candidates = list(range(1, len(script_data) - 1))
+            avatar_indices = sorted(random.sample(candidates, min(2, len(candidates))))
         for i, scene in enumerate(script_data):
-            current_pair = video_pairs[i]
-            is_avatar = False
+            pair = video_pairs[i] if i < len(video_pairs) else None
+            is_avatar = i in avatar_indices
+            if is_avatar:
+                pair = (self.avatar_path, None)
+            if not pair:
+                print(f"Skipping scene {scene.get('id', i + 1)}: no footage.")
+                continue
+            output = self.process_scene(scene, pair, is_avatar)
+            if output:
+                rendered.append(output)
+                self.rendered_scenes.append(scene)
+        return rendered
 
-            # Injection Logic: Check if current index is in our chosen list
-            if i in avatar_indices:
-                current_pair = (self.avatar_path, None)
-                is_avatar = True
-            elif current_pair is None:
-                continue 
+    @staticmethod
+    def _ass_time(seconds):
+        cs = int(round(max(0.0, float(seconds)) * 100))
+        hours, cs = divmod(cs, 360000)
+        minutes, cs = divmod(cs, 6000)
+        secs, cs = divmod(cs, 100)
+        return f"{hours}:{minutes:02}:{secs:02}.{cs:02}"
 
-            output_path = self.process_scene(scene, current_pair, is_avatar)
-            if output_path:
-                rendered_paths.append(output_path)
-        
-        return rendered_paths
+    @staticmethod
+    def _clean_text(text):
+        text = str(text).replace("{", "(").replace("}", ")")
+        return re.sub(r"\s+", " ", text).strip()
 
-    def concatenate_with_transitions(self, video_paths, output_filename="final_short.mp4"):
-        """
-        Stitches rendered scenes together.
-        INCLUDES FIXES FOR: Windows 0x80004005 Error & Playback Issues.
-        """
-        print("🎬 Stitching final video...")
+    def _write_karaoke_ass(self, script_data, output_path):
+        # Each timed event shows a short phrase; the spoken word changes to yellow.
+        header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Karaoke,Arial,52,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,1,2,100,100,78,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        events = []
+        cursor = 0.0
+        for scene_index, scene in enumerate(script_data):
+            duration = float(scene.get("duration", 0) or 0)
+            words = self._clean_text(scene.get("text", "")).split()
+            if duration <= 0 or not words:
+                cursor += max(0.0, duration - self.transition_seconds)
+                continue
+            chunks = [words[i:i + 5] for i in range(0, len(words), 5)]
+            weights = [sum(max(1, len(w.strip(".,!?;:()\"'"))) for w in chunk) for chunk in chunks]
+            total_weight = max(1, sum(weights))
+            local_time = 0.0
+            for chunk, chunk_weight in zip(chunks, weights):
+                chunk_duration = duration * chunk_weight / total_weight
+                word_weights = [max(1, len(w.strip(".,!?;:()\"'"))) for w in chunk]
+                word_total = max(1, sum(word_weights))
+                word_time = local_time
+                for active_index, (word, weight) in enumerate(zip(chunk, word_weights)):
+                    word_duration = chunk_duration * weight / word_total
+                    visible = []
+                    for j, item in enumerate(chunk):
+                        visible.append((r"{\c&H0000FFFF&}" + item + r"{\c&H00FFFFFF&}") if j == active_index else item)
+                    events.append(
+                        f"Dialogue: 0,{self._ass_time(cursor + word_time)},{self._ass_time(cursor + word_time + max(0.04, word_duration))},Karaoke,,0,0,0,,{' '.join(visible)}"
+                    )
+                    word_time += word_duration
+                local_time += chunk_duration
+            cursor += max(0.0, duration - self.transition_seconds) if scene_index < len(script_data) - 1 else duration
+        with open(output_path, "w", encoding="utf-8-sig") as handle:
+            handle.write(header + "\n".join(events) + "\n")
+        return output_path
+
+    def concatenate_with_transitions(self, video_paths, output_filename="final_video.mp4", script_data=None):
+        print("Stitching 16:9 video and permanently burning word-highlight karaoke captions...")
         output_path = os.path.join(self.final_dir, output_filename)
-        
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except:
-                print("⚠️ Warning: Could not delete old file. It might be open in a player.")
-
         if not video_paths:
+            print("No rendered scenes to stitch.")
             return None
-
-        input1 = ffmpeg.input(video_paths[0])
-        v_stream = input1.video
-        a_stream = input1.audio
-        
-        current_dur = self.get_duration(video_paths[0])
-
-        for i in range(1, len(video_paths)):
-            next_clip = ffmpeg.input(video_paths[i])
-            next_dur = self.get_duration(video_paths[i])
-            
-            trans_dur = 0.5
-            offset = current_dur - trans_dur
-            
-            effect = random.choice(self.transitions)
-            print(f"   ✨ Transition {i}: '{effect}' at {offset:.2f}s")
-
-            v_stream = ffmpeg.filter(
-                [v_stream, next_clip.video], 
-                'xfade', 
-                transition=effect, 
-                duration=trans_dur, 
-                offset=offset
-            )
-            
-            a_stream = ffmpeg.filter(
-                [a_stream, next_clip.audio], 
-                'acrossfade', 
-                d=trans_dur
-            )
-            
-            current_dur = (current_dur + next_dur) - trans_dur
-
         try:
-            runner = ffmpeg.output(
-                v_stream, 
-                a_stream, 
-                output_path, 
-                vcodec='libx264',   # Standard H.264 video
-                acodec='aac',       # Standard AAC audio
-                pix_fmt='yuv420p',  # 🔥 FIX 1: Windows compatibility
-                movflags='faststart', # 🔥 FIX 2: Corruption fix
-                preset='medium' 
-            )
-            
-            runner.run(overwrite_output=True, quiet=False)
-            
-            print(f"✅ FINAL VIDEO SAVED: {output_path}")
+            inputs = [ffmpeg.input(path) for path in video_paths]
+            v_stream, a_stream = inputs[0].video, inputs[0].audio
+            current_duration = self.get_duration(video_paths[0])
+            for i in range(1, len(inputs)):
+                next_duration = self.get_duration(video_paths[i])
+                trans_duration = min(self.transition_seconds, max(0.08, next_duration / 5))
+                offset = max(0.0, current_duration - trans_duration)
+                v_stream = ffmpeg.filter([v_stream, inputs[i].video], "xfade",
+                                          transition=random.choice(self.transitions), duration=trans_duration, offset=offset)
+                a_stream = ffmpeg.filter([a_stream, inputs[i].audio], "acrossfade", d=trans_duration)
+                current_duration += next_duration - trans_duration
+            if script_data:
+                ass_path = os.path.abspath(os.path.join(self.temp_dir, "karaoke_captions.ass"))
+                self._write_karaoke_ass(script_data, ass_path)
+                v_stream = v_stream.filter("subtitles", filename=ass_path)
+            (ffmpeg.output(v_stream, a_stream, output_path, vcodec="libx264", acodec="aac",
+                           pix_fmt="yuv420p", r=self.fps, movflags="faststart",
+                           preset=os.getenv("FFMPEG_PRESET", "veryfast"))
+             .run(overwrite_output=True, quiet=False))
+            print(f"FINAL VIDEO SAVED: {output_path}")
             return output_path
-
-        except ffmpeg.Error as e:
-            error_log = e.stderr.decode('utf8') if e.stderr else str(e)
-            print(f"❌ Stitching Error: {error_log}")
+        except ffmpeg.Error as exc:
+            stderr = (exc.stderr or b"").decode("utf8", errors="replace")
+            print(f"Stitching error: {stderr[-5000:]}")
             return None
